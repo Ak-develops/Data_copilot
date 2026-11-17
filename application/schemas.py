@@ -51,9 +51,12 @@ class ChatResponse(BaseModel):
     answer: str = Field(..., description="Textual answer from the agent")
     tool_used: Optional[str] = Field(None, description="Name of the invoked tool")
     tool_args: Optional[dict[str, Any]] = Field(None, description="Arguments passed")
+    args_from_history: Optional[list[str]] = Field(None, description="Param names resolved from conversation history")
     chart_path: Optional[str] = Field(None, description="Path to generated chart image")
     routing_mode: str = Field(..., description="Which routing mode was used")
     latency_ms: float = Field(..., description="End-to-end latency in milliseconds")
+    is_new_interface: bool = Field(False, description="Whether a new interface was created for this query")
+    token_usage: int = Field(0, description="Total tokens used for this query")
 
 
 class BenchmarkResult(BaseModel):

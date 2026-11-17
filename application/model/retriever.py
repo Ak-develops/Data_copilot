@@ -1,12 +1,8 @@
-"""Semantic vector retrieval for tool selection.
+"""Dynamic semantic retriever for the Interface Library.
 
-Encodes all tool descriptions into vector embeddings using
-sentence-transformers (all-MiniLM-L6-v2) and stores them in a FAISS
-index for fast similarity search.
-
-This implements the "vector" routing mode from the research paper:
-instead of stuffing every tool into the LLM prompt, only the top-k
-most semantically relevant tools are retrieved for a given query.
+Encodes all interface descriptions into FAISS and retrieves the most
+relevant existing interfaces for a given query. Rebuilt whenever a new
+interface is added to the library.
 """
 
 from __future__ import annotations
@@ -18,64 +14,64 @@ import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from model.tools import TOOL_REGISTRY
-
 logger = logging.getLogger(__name__)
 
 
 class ToolRetriever:
-    """Vector-indexed tool retriever using sentence-transformers + FAISS."""
+    """FAISS-backed semantic search over the dynamic interface library."""
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2") -> None:
         self.encoder = SentenceTransformer(model_name)
-        self.tools = TOOL_REGISTRY
-        self.descriptions = [t["description"] for t in self.tools]
+        self._tools: list[dict[str, str]] = []
+        self._embeddings: np.ndarray | None = None
+        self._index: faiss.IndexFlatIP | None = None
+        logger.info("ToolRetriever initialized")
 
-        # Encode all tool descriptions (normalized for cosine similarity)
-        self.embeddings = self.encoder.encode(
-            self.descriptions,
+    def rebuild(self, tools: list[dict[str, str]]) -> None:
+        """Rebuild the FAISS index from current interface descriptions."""
+        if not tools:
+            self._tools = []
+            self._index = None
+            return
+
+        self._tools = tools
+        descriptions = [t["description"] for t in tools]
+        self._embeddings = self.encoder.encode(
+            descriptions,
             normalize_embeddings=True,
             convert_to_numpy=True,
         ).astype(np.float32)
 
-        # Build FAISS index (inner product = cosine similarity on normalized vectors)
-        dim = self.embeddings.shape[1]
-        self.index = faiss.IndexFlatIP(dim)
-        self.index.add(self.embeddings)
+        dim = self._embeddings.shape[1]
+        self._index = faiss.IndexFlatIP(dim)
+        self._index.add(self._embeddings)
+        logger.info("FAISS index rebuilt | interfaces=%d", len(tools))
 
-        logger.info(
-            "ToolRetriever initialized | tools=%d | embedding_dim=%d",
-            len(self.tools), dim,
-        )
+    def retrieve(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
+        """Return top-k most relevant interfaces for the query."""
+        if self._index is None or not self._tools:
+            return []
 
-    def retrieve(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
-        """Retrieve the top-k most relevant tools for a given query.
-
-        Args:
-            query: Natural-language user query.
-            top_k: Maximum number of tools to return.
-
-        Returns:
-            List of dicts, each containing the tool dict and a similarity score.
-        """
         query_vec = self.encoder.encode(
             [query], normalize_embeddings=True, convert_to_numpy=True
         ).astype(np.float32)
 
-        k = min(top_k, len(self.tools))
-        scores, indices = self.index.search(query_vec, k)
+        k = min(top_k, len(self._tools))
+        scores, indices = self._index.search(query_vec, k)
 
         results = []
         for score, idx in zip(scores[0], indices[0]):
             if idx >= 0:
                 results.append({
-                    "tool": self.tools[idx],
+                    "tool": self._tools[idx],
                     "score": float(score),
                 })
 
-        logger.info("Retrieved %d tools for query: '%s'", len(results), query[:80])
         return results
 
-    def retrieve_tool_names(self, query: str, top_k: int = 5) -> list[str]:
-        """Convenience method — return just the tool names."""
-        return [r["tool"]["name"] for r in self.retrieve(query, top_k)]
+    def best_match(self, query: str, threshold: float = 0.55) -> dict[str, str] | None:
+        """Return the single best matching interface if above similarity threshold."""
+        results = self.retrieve(query, top_k=1)
+        if results and results[0]["score"] >= threshold:
+            return results[0]["tool"]
+        return None
