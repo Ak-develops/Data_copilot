@@ -58,16 +58,29 @@ class BaselineAgent:
 TICKER MAPPING:
 {ticker_mapping}
 
-IMPORTANT:
-- Import all modules INSIDE the generated code
-- Use df = _load_data() to get the dataset
-- Return a dict result
-- For charts: save to settings.charts_dir, call plt.close(fig), include "chart_path" in result
+CRITICAL RULES:
+- You MUST use df = _load_data() to get the dataset (it's already available in the environment)
+- DO NOT use pd.read_csv() directly - it will fail
+- DO NOT hardcode any file paths - use _load_data() only
+- For charts: save to settings.charts_dir / "filename.png", call plt.close(fig), include "chart_path" in result
+- Return a dict as 'result' variable
 - Handle errors gracefully
+
+EXAMPLE CODE STRUCTURE:
+```python
+# Get data using the provided function
+df = _load_data()
+
+# Your analysis here
+...
+
+# Return result
+result = {{"value": 123, "chart_path": "path/to/chart.png"}}
+```
 
 Respond with ONLY valid JSON:
 {{
-  "code": "import pandas as pd\\nimport matplotlib.pyplot as plt\\n...\\nresult = {{'value': 123}}",
+  "code": "df = _load_data()\\n# analysis here\\nresult = {{'value': 123}}",
   "description": "what this code does"
 }}
 """

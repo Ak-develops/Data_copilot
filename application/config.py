@@ -30,7 +30,12 @@ class Settings(BaseSettings):
     # ── Paths ───────────────────────────────────────────────────
     base_dir: Path = Path(__file__).resolve().parent
     charts_dir: Path = base_dir / "static" / "charts"
-    dataset_path: Path = base_dir.parent / "data" / "indian_stocks.csv"
+    # Use absolute path to avoid relative path issues in generated interfaces
+    dataset_path: Path = base_dir / "data" / "indian_stocks.csv"
+    
+    # ── DAG Execution ───────────────────────────────────────────
+    enable_dag_execution: bool = True  # Enable multi-step DAG execution
+    dag_complexity_threshold: int = 3  # Minimum complexity score to trigger DAG
 
 
 settings = Settings()

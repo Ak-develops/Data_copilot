@@ -19,6 +19,8 @@ from model.tools import interface_library, get_dataset_schema
 from model.retriever import ToolRetriever
 from model.agent import Agent
 from model.executor import Executor
+from model.dag_planner import dag_planner
+from model.dag_executor import dag_executor
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +61,79 @@ class AgentService:
         start = time.perf_counter()
         is_new_interface = False
         total_tokens = 0  # Track total token usage
+        use_dag = False  # Track if DAG was used
+        
+        # ── Step 0: Check if query needs DAG execution ─────────
+        should_use_dag, complexity_score = dag_planner.should_use_dag(query)
+        
+        if should_use_dag and settings.enable_dag_execution:
+            logger.info("Query complexity score: %d - attempting DAG execution", complexity_score)
+            
+            # Get available interfaces for DAG planning
+            available_interfaces = interface_library.get_descriptions()
+            
+            # Generate DAG plan
+            dag = dag_planner.generate_dag(query, available_interfaces)
+            total_tokens += dag.get("token_usage", {}).get("total_tokens", 0)
+            
+            if dag.get("use_dag"):
+                logger.info("Using DAG execution with %d steps", len(dag.get("steps", [])))
+                use_dag = True
+                
+                # Execute DAG
+                dag_result = dag_executor.execute_dag(dag, query)
+                
+                if dag_result["success"]:
+                    # Collect all chart paths from DAG execution
+                    chart_paths = []
+                    for step_result in dag_result["steps_results"].values():
+                        if isinstance(step_result, dict):
+                            for key, value in step_result.items():
+                                if (key.endswith("_chart_path") or key.endswith("_path") or key == "chart_path") and isinstance(value, str):
+                                    chart_paths.append(value)
+                    
+                    chart_path = chart_paths[0] if chart_paths else None
+                    
+                    # Synthesize answer
+                    answer, synth_tokens = self.agent.synthesize_answer(
+                        query,
+                        f"DAG ({dag_result['steps_executed']} steps)",
+                        {},
+                        dag_result["result"],
+                        is_new=bool(dag_result["interfaces_created"])
+                    )
+                    total_tokens += synth_tokens.get("total_tokens", 0)
+                    
+                    if dag_result["interfaces_created"]:
+                        interfaces_list = ", ".join(f"`{name}`" for name in dag_result["interfaces_created"])
+                        answer = f"✨ *Multi-step execution: {dag_result['steps_executed']} steps, created interfaces: {interfaces_list}*\n\n{answer}"
+                    
+                    latency_ms = (time.perf_counter() - start) * 1000
+                    logger.info("DAG execution complete | steps=%d | new_interfaces=%d | latency=%.0fms | tokens=%d",
+                                dag_result['steps_executed'], len(dag_result['interfaces_created']), latency_ms, total_tokens)
+                    
+                    return {
+                        "answer": answer,
+                        "tool_used": "DAG Multi-Step",
+                        "tool_args": {"steps": len(dag["steps"])},
+                        "args_from_history": [],
+                        "chart_path": chart_path,
+                        "chart_paths": chart_paths,
+                        "routing_mode": routing_mode or settings.routing_mode,
+                        "latency_ms": latency_ms,
+                        "is_new_interface": bool(dag_result["interfaces_created"]),
+                        "token_usage": total_tokens,
+                        "used_dag": True,
+                        "dag_steps": dag_result['steps_executed'],
+                    }
+                else:
+                    logger.warning("DAG execution failed: %s - falling back to single-step", dag_result["error"])
+                    # Fall through to single-step execution
+            else:
+                logger.info("DAG planner determined single-step is sufficient: %s", dag.get("reason", ""))
 
-        # ── Step 1: Find best matching existing interface ──────
-        candidate = self.retriever.best_match(query, threshold=0.35)
+        # ── Single-Step Execution (original logic) ──────────────
+        candidate = self.retriever.best_match(query, threshold=0.20)  # Lowered from 0.25 to catch more candidates
         candidate_score = None
         if candidate:
             # Get the actual similarity score for the LLM to reason about
@@ -69,7 +141,7 @@ class AgentService:
             if results:
                 candidate_score = results[0]["score"]
         
-        logger.info("Best match for query: %s (score=%.2f, threshold=0.35)",
+        logger.info("Best match for query: %s (score=%.2f, threshold=0.20)",
                     candidate["name"] if candidate else "None",
                     candidate_score if candidate_score else 0.0)
 
@@ -153,8 +225,16 @@ class AgentService:
                 error = exec_result.get("error")
 
         chart_path = None
+        chart_paths = []
         if isinstance(tool_output, dict):
-            chart_path = tool_output.get("chart_path")
+            # Collect all chart paths from the result
+            for key, value in tool_output.items():
+                if (key.endswith("_chart_path") or key.endswith("_path") or key == "chart_path") and isinstance(value, str):
+                    chart_paths.append(value)
+            
+            # For backward compatibility, set chart_path to first one
+            if chart_paths:
+                chart_path = chart_paths[0]
 
         # ── Step 5: Synthesize answer ──────────────────────────
         if error:
@@ -186,10 +266,13 @@ class AgentService:
             "tool_args": args,
             "args_from_history": args_from_history,
             "chart_path": chart_path,
+            "chart_paths": chart_paths,  # All chart paths
             "routing_mode": routing_mode or settings.routing_mode,
             "latency_ms": latency_ms,
             "is_new_interface": is_new_interface,
             "token_usage": total_tokens,
+            "used_dag": False,
+            "dag_steps": 0,
         }
 
 

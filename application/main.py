@@ -30,6 +30,19 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Application Layer | routing=%s | port=%d", settings.routing_mode, settings.api_port)
+    
+    # Auto-seed interface library if empty
+    from model.tools import interface_library
+    if len(interface_library.list_all()) == 0:
+        logger.info("Interface library is empty - auto-seeding with pre-built interfaces...")
+        try:
+            from seed_library import seed_interface_library
+            seed_interface_library()
+        except Exception as e:
+            logger.warning("Failed to auto-seed interface library: %s", e)
+    else:
+        logger.info("Interface library loaded with %d interfaces", len(interface_library.list_all()))
+    
     yield
     logger.info("Shutting down Application Layer")
 

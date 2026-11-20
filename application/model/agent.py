@@ -70,43 +70,92 @@ class Agent:
               "args": dict | None,
             }
         """
-        schema = get_dataset_schema()
+        # Extract function signature from the interface code if available
+        interface_sig = ""
+        if candidate:
+            try:
+                from model.tools import interface_library
+                interface_code = interface_library._registry.get(candidate["name"], {}).get("code", "")
+                # Extract first line of function definition
+                for line in interface_code.split("\n"):
+                    if line.strip().startswith("def "):
+                        interface_sig = line.strip()
+                        break
+            except:
+                pass
+        
         existing_desc = (
             f"Existing interface: `{candidate['name']}` — {candidate['description']}\n"
-            f"Similarity score: {similarity_score:.2f} (1.0 = perfect match, 0.0 = no match)"
+            f"Function signature: {interface_sig if interface_sig else 'Unknown - only use ticker parameter'}\n"
+            f"Similarity score: {similarity_score:.2f} (1.0 = perfect match, 0.0 = no match)\n\n"
+            f"⚠️ CRITICAL: Only pass parameters that exist in the function signature above!"
             if candidate else "No existing interface found."
         )
 
-        system = f"""You are an AI agent that decides how to answer stock analysis queries.
+        system = f"""You decide how to answer stock queries.
 
-Dataset schema:
-{schema}
+DATASET: indian_stocks.csv (Date, Ticker, Open, High, Low, Close, Volume)
+DATA AVAILABLE: 2022-01-01 to 2024-12-31 (NO 2025 or 2026 data!)
+
+CRITICAL TICKER FORMAT:
+- All tickers MUST use .NS suffix (NSE stocks)
+- "TCS" → "TCS.NS"
+- "Infosys" or "INFY" → "INFY.NS"
+- "Wipro" → "WIPRO.NS"
+- "Reliance" → "RELIANCE.NS"
+- "HDFC Bank" or "HDFCBANK" → "HDFCBANK.NS"
+- "ICICI Bank" or "ICICIBANK" → "ICICIBANK.NS"
+- "ITC" → "ITC.NS"
+- "SBI" or "State Bank" → "SBIN.NS"
+- "HCL Tech" or "HCL" → "HCLTECH.NS"
+- "Asian Paints" → "ASIANPAINT.NS"
 
 {existing_desc}
 
-DECISION RULES:
-- If similarity score >= 0.50: STRONGLY prefer reuse (unless fundamentally incompatible)
-- If similarity score >= 0.35: Reuse if the existing interface can be adapted with different parameters
-- If no interface exists (score < 0.35) or existing one is fundamentally incompatible: create new
+CRITICAL PARAMETER MATCHING:
+- You MUST use ONLY the parameters that the interface accepts
+- DO NOT add extra parameters (like 'year' if interface doesn't have it)
+- DO NOT rename parameters
+- If interface signature doesn't match query needs, choose action=create instead
 
-Examples of REUSABLE scenarios:
-✓ "plot TCS and Wipro for 2024" → reuse "plot_stock_comparison" (different tickers/dates)
-✓ "show me average values for 3 stocks" → reuse "plot_average_stock_values" (different tickers)
-✓ "what's the price of Reliance" → reuse "get_latest_closing_price" (different ticker)
+Example:
+- Interface: get_current_price(ticker: str)
+- Query: "current price of TCS in 2024"
+- CORRECT: action=reuse, args={{"ticker": "TCS.NS"}}  (ignore year, interface doesn't need it)
+- WRONG: action=reuse, args={{"ticker": "TCS.NS", "year": 2024}}  (adds non-existent parameter!)
 
-Examples of CREATE NEW scenarios:
-✗ User wants "moving average" but only "latest price" interface exists (different calculation)
-✗ User wants "bar chart" but only "line chart" interface exists (different visualization)
+CRITICAL REUSE RULES:
+- Score >= 0.35: YOU MUST REUSE (almost identical functionality)
+- Score >= 0.25: STRONGLY PREFER reuse unless fundamentally impossible  
+- Score >= 0.20: Try to reuse by adapting parameters
+- Score < 0.20: Create new only if truly necessary
 
-Respond with ONLY valid JSON in one of these two formats:
+WHEN TO REUSE:
+✓ Different tickers but same operation → REUSE
+✓ Different dates but same calculation → REUSE
+✓ Different window (50-day vs 200-day MA) but same concept → REUSE
+✓ Different number of stocks but same comparison → REUSE
+✓ Similar intent (e.g., "current price", "latest price", "price today") → REUSE
+✓ Query asks for data the interface can provide → REUSE
+✓ "Show chart", "plot", "visualize" + stock → REUSE plot_stock_trend
+✓ "Get data", "show data", "stock data" + chart → REUSE plot_stock_trend
+✓ ANY query about showing/plotting single stock price → REUSE plot_stock_trend
 
-For reuse:
-{{"action": "reuse", "interface_name": "<name>", "args": {{...}}}}
+WHEN TO CREATE:
+✗ User wants bar chart but interface only makes line charts
+✗ User wants volatility but interface only does returns
+✗ Completely different analysis type
 
-For create:
-{{"action": "create", "interface_name": null, "args": null}}
+CRITICAL YEAR EXTRACTION:
+- If query mentions "2022", "2023", or "2024", extract that year
+- If no year mentioned, use latest available (2024)
+- NEVER use 2025 or 2026 (no data!)
 
-Do NOT output anything except the JSON."""
+OUTPUT (JSON only):
+Reuse: {{"action": "reuse", "interface_name": "<name>", "args": {{"ticker": "TCS.NS", "year": 2024}}}}
+Create: {{"action": "create", "interface_name": null, "args": null}}
+
+ALWAYS use .NS suffix for tickers and correct year (2022-2024)! RESPOND ONLY WITH JSON. NO EXPLANATIONS."""
 
         messages = [{"role": "system", "content": system}]
         if history:
@@ -141,45 +190,58 @@ Do NOT output anything except the JSON."""
               "token_usage": dict,
             }
         """
-        schema = get_dataset_schema()
-        ticker_mapping = get_ticker_mapping()
         total_token_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-        system = f"""You are an expert Python data analyst. Write a Python function that answers the user's stock analysis query.
+        system = f"""You are a Python data analyst. Write a function for the user's stock query.
 
-{schema}
+DATASET: indian_stocks.csv with columns: Date, Ticker, Open, High, Low, Close, Volume
+DATA RANGE: 2022-01-01 to 2024-12-31 (NO 2025 or 2026 data!)
 
-TICKER MAPPING (user-friendly names to NSE tickers):
-{ticker_mapping}
+CRITICAL TICKER FORMAT (MUST USE .NS SUFFIX):
+"TCS" → "TCS.NS"
+"Infosys"/"INFY" → "INFY.NS"
+"Wipro" → "WIPRO.NS"
+"Reliance" → "RELIANCE.NS"
+"HDFC Bank"/"HDFCBANK" → "HDFCBANK.NS"
+"ICICI Bank"/"ICICIBANK" → "ICICIBANK.NS"
+"ITC" → "ITC.NS"
+"SBI"/"State Bank" → "SBIN.NS"
+"HCL Tech"/"HCL" → "HCLTECH.NS"
+"Asian Paints" → "ASIANPAINT.NS"
 
-IMPORTANT: Always convert user-friendly names to their .NS ticker symbols (e.g., "Infosys" → "INFY.NS", not "INFOSYS.NS").
+RULES:
+1. Function name: GENERIC lowercase verb (get_, plot_, compare_, calculate_)
+   ❌ BAD: plot_tcs_50day_ma, get_bajaj_finance_range
+   ✅ GOOD: plot_moving_average, get_price_range
+2. Use PARAMETERS for specificity, NOT function names
+   ❌ BAD: def get_tcs_price() - hardcoded company
+   ✅ GOOD: def get_current_price(ticker: str) - parameterized
+3. Import ALL modules INSIDE the function:
+   from config import settings
+   import pandas as pd
+   import matplotlib.pyplot as plt
+4. Load data: df = _load_data()
+5. ALWAYS use .NS suffix for ticker parameters
+6. ALWAYS use years 2022-2024 only (default to 2024)
+7. Charts: save to settings.charts_dir/"file.png", call plt.close(fig), return {{"chart_path": ...}}
+8. Always return a dict
+9. Handle missing tickers with try/except
 
-CODE GENERATION RULES:
-1. The function MUST be named starting with a lowercase verb (e.g., get_, plot_, compare_, calculate_, show_)
-2. Use typed parameters with defaults where sensible
-3. CRITICAL: Import all required modules INSIDE the function body, before using them:
-   - from config import settings
-   - import pandas as pd
-   - import matplotlib.pyplot as plt
-   - etc.
-4. Get the dataframe using: df = _load_data()
-5. For charts: use matplotlib, save to settings.charts_dir / "filename.png", call plt.close(fig), include "chart_path" in the return dict
-6. Always return a dict (never return None or other types)
-7. Include error handling for missing tickers or empty dataframes
-8. Use ONLY these pre-available names: _load_data, logger, pd, np, plt, Path, settings (import others inside the function)
+NAMING EXAMPLES:
+Query: "Plot 50-day MA for TCS" → name="plot_moving_average", args={{"ticker":"TCS.NS", "window":50}}
+Query: "Bajaj Finance 2024 range" → name="get_price_range", args={{"ticker":"BAJFINANCE.NS", "weeks":52}}
+Query: "Compare TCS vs Infosys" → name="compare_two_stocks", args={{"ticker1":"TCS.NS", "ticker2":"INFY.NS"}}
 
-JSON OUTPUT FORMAT (MUST be valid JSON, no trailing commas, properly escaped strings):
+OUTPUT (valid JSON only):
 {{
   "name": "function_name",
-  "description": "one sentence describing what this function does",
-  "code": "def function_name(...):\\n    from config import settings\\n    import pandas as pd\\n    ...",
-  "args": {{"param1": "value1", ...}},
-  "test_args": {{"param1": "test_value1", ...}}
+  "description": "brief description",
+  "code": "def function_name(...):\\n    import pandas as pd\\n    ...",
+  "args": {{"ticker": "TCS.NS", "year": 2024}},
+  "test_args": {{"ticker": "TCS.NS", "year": 2024}}
 }}
 
-The "args" should be the actual arguments to call the function with for this specific query.
-The "test_args" should be safe test arguments (use real tickers like TCS.NS, RELIANCE.NS, INFY.NS).
-Respond with ONLY valid JSON. Do NOT include anything outside the JSON."""
+CRITICAL: Use .NS suffix and year 2022-2024 in ALL args/test_args! Respond ONLY with JSON."""
 
         for attempt in range(3):
             try:
@@ -224,8 +286,9 @@ Respond with ONLY valid JSON. Do NOT include anything outside the JSON."""
                         "Interface '%s' failed test (attempt %d): %s",
                         name, attempt + 1, error_msg
                     )
-                    # Feed error back to LLM for self-correction
-                    system += f"\n\nPrevious attempt FAILED with: {error_msg}\nFix this bug in the next attempt. Make sure to import all modules and check your JSON syntax."
+                    # Feed error back to LLM for self-correction (limit to 200 chars to avoid token explosion)
+                    short_error = error_msg[:200] if len(error_msg) > 200 else error_msg
+                    system += f"\n\nPrevious attempt FAILED with: {short_error}\nFix this bug. Check imports and JSON syntax."
 
             except Exception as e:
                 error_msg = f"{type(e).__name__}: {str(e)[-200:]}"
@@ -289,6 +352,15 @@ Respond with ONLY valid JSON. Do NOT include anything outside the JSON."""
             return f"⚠️ {result['error']}", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
         new_note = " (newly created interface)" if is_new else ""
+        
+        # Truncate large results to avoid 413 errors
+        result_str = json.dumps(result, indent=2, default=str)
+        if len(result_str) > 1000:
+            # Keep only keys and first 500 chars of result
+            truncated_result = {k: str(v)[:100] + "..." if len(str(v)) > 100 else v 
+                               for k, v in list(result.items())[:5]}
+            result_str = json.dumps(truncated_result, indent=2, default=str)
+        
         system = """You are a stock analysis assistant. Summarize the tool result clearly and concisely.
 - Use bullet points for structured data
 - Include specific numbers (prices, percentages)
@@ -298,8 +370,8 @@ Respond with ONLY valid JSON. Do NOT include anything outside the JSON."""
         user_content = (
             f"Query: {query}\n"
             f"Interface used: {interface_name}{new_note}\n"
-            f"Args: {json.dumps(args, default=str)}\n"
-            f"Result: {json.dumps(result, indent=2, default=str)}"
+            f"Args: {json.dumps(args, default=str)[:200]}\n"
+            f"Result: {result_str}"
         )
         try:
             content, token_usage = self._llm(
@@ -313,7 +385,10 @@ Respond with ONLY valid JSON. Do NOT include anything outside the JSON."""
             return content, token_usage
         except Exception as e:
             logger.error("synthesize_answer failed: %s", e)
-            return json.dumps(result, indent=2, default=str), {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            # Fallback: return simple summary without LLM
+            if "chart_path" in result:
+                return f"✅ Generated chart: {result['chart_path']}", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+            return json.dumps(result, indent=2, default=str)[:500], {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     # ── JSON parsing ───────────────────────────────────────────────
 
