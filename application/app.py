@@ -6,11 +6,28 @@ import time
 import requests
 import streamlit as st
 
+from config import settings
+from logger import (
+    generate_id,
+    get_logger,
+    reset_request_context,
+    set_request_context,
+    setup_logging,
+    truncate_payload,
+)
+
+setup_logging(settings.log_level)
+logger = get_logger(__name__)
+
 st.set_page_config(
     page_title="Stock Agent Chat",
     page_icon="📊",
     layout="wide",
 )
+
+if "session_id" not in st.session_state:
+    st.session_state["session_id"] = generate_id("sess-")
+    logger.info("Initialized new Streamlit session | session_id=%s", st.session_state["session_id"])
 
 API_BASE = "http://localhost:8000"
 
@@ -87,28 +104,54 @@ def get_history() -> list[dict[str, str]]:
 
 
 def call_api_and_render(prompt: str) -> None:
+    session_id = st.session_state.get("session_id", "-")
+    req_id = generate_id("req-")
+    tokens = set_request_context(request_id=req_id, session_id=session_id)
+    req_start = time.perf_counter()
+
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
                 agent_mode = st.session_state.get("agent_mode", "interface")
-                
+                routing_mode = st.session_state.get("routing_mode", "vector")
+
                 # Choose endpoint based on mode
                 if agent_mode == "interface":
                     endpoint = f"{API_BASE}/api/chat"
                 else:
                     endpoint = f"{API_BASE}/api/chat/baseline"
-                
+
+                logger.info(
+                    "UI sending query | mode=%s | routing=%s | endpoint=%s | query=%s",
+                    agent_mode,
+                    routing_mode,
+                    endpoint,
+                    truncate_payload(prompt, 500),
+                )
+
                 resp = requests.post(
                     endpoint,
                     json={
                         "query": prompt,
-                        "routing_mode": st.session_state.get("routing_mode", "vector"),
+                        "routing_mode": routing_mode,
                         "history": get_history(),
+                    },
+                    headers={
+                        "X-Request-ID": req_id,
+                        "X-Session-ID": session_id,
                     },
                     timeout=60,
                 )
+                ui_latency_ms = (time.perf_counter() - req_start) * 1000
                 if resp.ok:
                     data = resp.json()
+                    logger.info(
+                        "UI received response | status=%d | tool=%s | api_latency=%.1fms | ui_latency=%.1fms",
+                        resp.status_code,
+                        data.get("tool_used"),
+                        data.get("latency_ms", 0.0),
+                        ui_latency_ms,
+                    )
                     st.markdown(data["answer"])
                     
                     # Display chart if available
@@ -119,6 +162,7 @@ def call_api_and_render(prompt: str) -> None:
                         try:
                             st.image(chart_path_str)
                         except Exception as e:
+                            logger.warning("Failed to render chart %s: %s", chart_path_str, e)
                             st.error(f"Could not load chart: {e}")
                             st.caption(f"Chart path: {chart_path_str}")
 
@@ -162,9 +206,17 @@ def call_api_and_render(prompt: str) -> None:
                         "chart": data.get("chart_path"),
                     })
                 else:
+                    logger.error(
+                        "API error response | status=%d | body=%s",
+                        resp.status_code,
+                        truncate_payload(resp.text, 500),
+                    )
                     st.error(f"API error: {resp.status_code} — {resp.text}")
             except requests.RequestException as e:
+                logger.exception("Could not reach API server: %s", e)
                 st.error(f"Could not reach API server: {e}")
+            finally:
+                reset_request_context(tokens)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────
@@ -203,23 +255,35 @@ st.sidebar.subheader("🔄 Reset System")
 st.sidebar.markdown("Clear conversation history and delete all registered interfaces.")
 
 if st.sidebar.button("🗑️ Reset Chat & Interfaces", type="primary", use_container_width=True):
+    session_id = st.session_state.get("session_id", "-")
+    tokens = set_request_context(request_id=generate_id("req-"), session_id=session_id)
     try:
+        logger.info("UI reset triggered")
         # Clear session state (conversation + interface log)
         st.session_state.messages = []
         st.session_state.interface_log = []
         
         # Delete all interfaces from backend
-        response = requests.post(f"{API_BASE}/api/reset", timeout=10)
+        response = requests.post(
+            f"{API_BASE}/api/reset",
+            headers={"X-Session-ID": session_id},
+            timeout=10,
+        )
         
         if response.ok:
+            logger.info("UI reset succeeded")
             st.sidebar.success("✅ System reset successfully!")
             st.sidebar.info("All interfaces deleted. Chat history cleared.")
             time.sleep(1)
             st.rerun()
         else:
+            logger.error("UI reset failed | status=%d | body=%s", response.status_code, truncate_payload(response.text, 300))
             st.sidebar.error(f"❌ Reset failed: {response.text}")
     except Exception as e:
+        logger.exception("UI reset error")
         st.sidebar.error(f"❌ Error: {e}")
+    finally:
+        reset_request_context(tokens)
 
 st.sidebar.divider()
 st.sidebar.info("💡 Use the **📚 Interface Library** tab to see all available interfaces and usage logs.")

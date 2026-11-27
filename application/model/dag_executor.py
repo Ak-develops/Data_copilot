@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-import logging
+import time
 from typing import Any
 from collections import defaultdict
 
+from logger import get_logger, sanitize_args, truncate_payload
 from model.executor import Executor
 from model.agent import Agent
 from model.tools import interface_library
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class DAGExecutor:
@@ -52,20 +53,24 @@ class DAGExecutor:
             }
         
         logger.info("Executing DAG with %d steps", len(sorted_steps))
-        
+        dag_start = time.perf_counter()
+
         for step in sorted_steps:
             step_id = step["id"]
             interface_name = step["interface"]
             args = step.get("args", {})
             description = step.get("description", "")
-            
-            logger.info("Step %d: %s - %s", step_id, interface_name, description)
-            
+            step_start = time.perf_counter()
+
+            logger.info("DAG step %d start | interface=%s | desc=%s", step_id, interface_name, truncate_payload(description, 200))
+
             try:
                 # Resolve argument references ($step1.result)
                 resolved_args = self._resolve_references(args, results)
+                logger.debug("DAG step %d resolved args: %s", step_id, sanitize_args(resolved_args))
             except Exception as e:
-                logger.error("Failed to resolve args for step %d: %s", step_id, e)
+                step_ms = (time.perf_counter() - step_start) * 1000
+                logger.error("DAG step %d failed arg resolution (duration=%.1fms): %s", step_id, step_ms, e)
                 return {
                     "success": False,
                     "result": None,
@@ -89,8 +94,9 @@ class DAGExecutor:
                 gen_result = self.agent.generate_interface(gen_query)
                 
                 if not gen_result["success"]:
+                    step_ms = (time.perf_counter() - step_start) * 1000
                     error_msg = gen_result.get('error', 'Unknown error')[:200]
-                    logger.error("Interface generation failed for step %d: %s", step_id, error_msg)
+                    logger.error("DAG step %d failed interface creation (duration=%.1fms): %s", step_id, step_ms, error_msg)
                     return {
                         "success": False,
                         "result": None,
@@ -118,10 +124,12 @@ class DAGExecutor:
             
             # Execute step
             exec_result = self.executor.execute(interface_name, resolved_args)
+            step_ms = (time.perf_counter() - step_start) * 1000
             
             if exec_result.get("error"):
                 error_msg = exec_result['error'][:200]
-                logger.error("Step %d execution failed: %s", step_id, error_msg)
+                logger.error("DAG step %d failed | interface=%s | status=failure | duration=%.1fms | error=%s",
+                             step_id, interface_name, step_ms, error_msg)
                 return {
                     "success": False,
                     "result": None,
@@ -134,14 +142,17 @@ class DAGExecutor:
             # Store result
             result_data = exec_result.get("result", {})
             results[step_id] = result_data
-            logger.info("Step %d completed: %s", step_id, str(result_data)[:100])
+            logger.info("DAG step %d completed | interface=%s | status=success | duration=%.1fms",
+                        step_id, interface_name, step_ms)
+            logger.debug("DAG step %d output: %s", step_id, truncate_payload(result_data, 500))
         
         # Return final step result
         final_step_id = sorted_steps[-1]["id"]
         final_result = results.get(final_step_id, {})
-        
-        logger.info("DAG execution complete: %d steps, %d interfaces created", 
-                    len(sorted_steps), len(interfaces_created))
+        total_dag_ms = (time.perf_counter() - dag_start) * 1000
+
+        logger.info("DAG execution complete | steps=%d | interfaces_created=%d | duration=%.1fms", 
+                    len(sorted_steps), len(interfaces_created), total_dag_ms)
         
         return {
             "success": True,

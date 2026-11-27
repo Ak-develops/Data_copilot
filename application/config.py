@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     enable_dag_execution: bool = True  # Enable multi-step DAG execution
     dag_complexity_threshold: int = 3  # Minimum complexity score to trigger DAG
 
+    # ── Logging ─────────────────────────────────────────────────
+    log_level: str = "INFO"
+
 
 settings = Settings()
 

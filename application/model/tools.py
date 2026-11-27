@@ -14,7 +14,7 @@ This implements Phase 1 of the research paper:
 from __future__ import annotations
 
 import json
-import logging
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Callable
@@ -26,8 +26,9 @@ import pandas as pd
 import numpy as np
 
 from config import settings
+from logger import get_logger, sanitize_args, truncate_payload
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ── Dataset loader ──────────────────────────────────────────────────
 _df_cache: pd.DataFrame | None = None
@@ -172,14 +173,26 @@ class InterfaceLibrary:
     def execute(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Execute a registered interface and return the result."""
         if name not in self._functions:
+            logger.error("Tool invocation failed: interface '%s' not found in library", name)
             return {"error": f"Interface '{name}' not found in library"}
+
+        start = time.perf_counter()
+        logger.info("Tool invoke | name=%s | args=%s", name, sanitize_args(args))
         try:
             self._registry[name]["call_count"] = \
                 self._registry[name].get("call_count", 0) + 1
             self._save_registry()
             result = self._functions[name](**args)
+            duration_ms = (time.perf_counter() - start) * 1000
+            if result is None or result == {}:
+                logger.warning("Tool returned empty result | name=%s | duration=%.1fms", name, duration_ms)
+            else:
+                logger.info("Tool completed | name=%s | duration=%.1fms", name, duration_ms)
+                logger.debug("Tool result | name=%s | output=%s", name, truncate_payload(result, 500))
             return {"result": result, "error": None}
         except Exception as e:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.exception("Tool error | name=%s | duration=%.1fms | error=%s", name, duration_ms, e)
             return {"result": None, "error": f"{type(e).__name__}: {e}"}
 
     def list_all(self) -> list[dict[str, Any]]:

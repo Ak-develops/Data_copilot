@@ -7,14 +7,16 @@ interface is added to the library.
 
 from __future__ import annotations
 
-import logging
+import time
 from typing import Any
 
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-logger = logging.getLogger(__name__)
+from logger import get_logger, truncate_payload
+
+logger = get_logger(__name__)
 
 
 class ToolRetriever:
@@ -50,8 +52,10 @@ class ToolRetriever:
     def retrieve(self, query: str, top_k: int = 3) -> list[dict[str, Any]]:
         """Return top-k most relevant interfaces for the query."""
         if self._index is None or not self._tools:
+            logger.warning("Retriever index is empty; returning 0 matches for query=%s", truncate_payload(query, 200))
             return []
 
+        start = time.perf_counter()
         query_vec = self.encoder.encode(
             [query], normalize_embeddings=True, convert_to_numpy=True
         ).astype(np.float32)
@@ -67,11 +71,31 @@ class ToolRetriever:
                     "score": float(score),
                 })
 
+        duration_ms = (time.perf_counter() - start) * 1000
+        top_summary = [(r["tool"]["name"], round(r["score"], 4)) for r in results]
+        logger.info(
+            "Retrieval complete | matches=%d | top=%s | duration=%.1fms | query=%s",
+            len(results),
+            top_summary,
+            duration_ms,
+            truncate_payload(query, 200),
+        )
         return results
 
     def best_match(self, query: str, threshold: float = 0.55) -> dict[str, str] | None:
         """Return the single best matching interface if above similarity threshold."""
         results = self.retrieve(query, top_k=1)
         if results and results[0]["score"] >= threshold:
+            logger.debug(
+                "Best match accepted | tool=%s | score=%.4f >= threshold=%.2f",
+                results[0]["tool"]["name"],
+                results[0]["score"],
+                threshold,
+            )
             return results[0]["tool"]
+        logger.debug(
+            "No match above threshold=%.2f (top_score=%.4f)",
+            threshold,
+            results[0]["score"] if results else 0.0,
+        )
         return None

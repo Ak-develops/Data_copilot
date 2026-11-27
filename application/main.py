@@ -12,24 +12,42 @@ Run with:
 
 from __future__ import annotations
 
-import logging
+import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
 from config import settings
-from schemas import ChatRequest, ChatResponse, ToolInfo, BenchmarkRequest, BenchmarkResult
-from services.agent_service import agent_service
+from logger import (
+    generate_id,
+    get_logger,
+    reset_request_context,
+    set_request_context,
+    setup_logging,
+    truncate_payload,
+)
 
 # ── Logging ────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-logger = logging.getLogger(__name__)
+setup_logging(settings.log_level)
+logger = get_logger(__name__)
+
+from schemas import ChatRequest, ChatResponse, ToolInfo, BenchmarkRequest, BenchmarkResult
+from services.agent_service import agent_service
 
 
 # ── Lifespan ────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting Application Layer | routing=%s | port=%d", settings.routing_mode, settings.api_port)
+    logger.info(
+        "Starting Application Layer | host=%s | port=%d | routing=%s | model=%s | dag=%s (threshold=%d) | log_level=%s",
+        settings.api_host,
+        settings.api_port,
+        settings.routing_mode,
+        settings.groq_model,
+        settings.enable_dag_execution,
+        settings.dag_complexity_threshold,
+        settings.log_level,
+    )
     
     # Auto-seed interface library if empty
     from model.tools import interface_library
@@ -38,8 +56,8 @@ async def lifespan(app: FastAPI):
         try:
             from seed_library import seed_interface_library
             seed_interface_library()
-        except Exception as e:
-            logger.warning("Failed to auto-seed interface library: %s", e)
+        except Exception:
+            logger.exception("Failed to auto-seed interface library")
     else:
         logger.info("Interface library loaded with %d interfaces", len(interface_library.list_all()))
     
@@ -56,6 +74,40 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    """Attach request/session context and log request lifecycle and unhandled exceptions."""
+    request_id = request.headers.get("X-Request-ID") or generate_id("req-")
+    session_id = request.headers.get("X-Session-ID") or "-"
+    tokens = set_request_context(request_id=request_id, session_id=session_id)
+    start = time.perf_counter()
+
+    logger.info("Incoming HTTP %s %s", request.method, request.url.path)
+    try:
+        response = await call_next(request)
+        latency_ms = (time.perf_counter() - start) * 1000
+        response.headers["X-Request-ID"] = request_id
+        logger.info(
+            "Completed HTTP %s %s | status=%d | latency=%.1fms",
+            request.method,
+            request.url.path,
+            response.status_code,
+            latency_ms,
+        )
+        return response
+    except Exception:
+        latency_ms = (time.perf_counter() - start) * 1000
+        logger.exception(
+            "Unhandled exception during HTTP %s %s | latency=%.1fms",
+            request.method,
+            request.url.path,
+            latency_ms,
+        )
+        raise
+    finally:
+        reset_request_context(tokens)
+
+
 # ── Routes ──────────────────────────────────────────────────────────
 
 @app.get("/api/tools", response_model=list[ToolInfo])
@@ -68,10 +120,24 @@ async def get_tools():
 async def chat(req: ChatRequest):
     """Accept a user query, invoke the Model Layer, return textual + chart output."""
     if not req.query.strip():
+        logger.warning("Rejected empty /api/chat query")
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
+    logger.info(
+        "Chat request | routing_mode=%s | history_turns=%d | query=%s",
+        req.routing_mode or settings.routing_mode,
+        len(req.history or []),
+        truncate_payload(req.query, 500),
+    )
     result = agent_service.process_query(req.query, routing_mode=req.routing_mode,
                                           history=req.history)
+    logger.info(
+        "Chat response | tool=%s | new_interface=%s | tokens=%s | latency=%.1fms",
+        result.get("tool_used"),
+        result.get("is_new_interface"),
+        result.get("token_usage"),
+        result.get("latency_ms", 0.0),
+    )
     return ChatResponse(**result)
 
 
@@ -79,10 +145,18 @@ async def chat(req: ChatRequest):
 async def chat_baseline(req: ChatRequest):
     """Accept a user query, use baseline agent (no interface reuse), return output."""
     if not req.query.strip():
+        logger.warning("Rejected empty /api/chat/baseline query")
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
+    logger.info("Baseline chat request | query=%s", truncate_payload(req.query, 500))
     from baseline_agent import baseline_agent
     result = baseline_agent.process_query(req.query)
+    logger.info(
+        "Baseline chat response | has_error=%s | tokens=%s | latency=%.1fms",
+        result.get("has_error"),
+        result.get("token_usage", {}).get("total_tokens"),
+        result.get("latency_ms", 0.0),
+    )
     
     # Convert baseline result to ChatResponse format
     return ChatResponse(
@@ -108,7 +182,7 @@ async def reset_system():
         logger.info("System reset: all interfaces cleared")
         return {"status": "success", "message": "All interfaces deleted and index rebuilt"}
     except Exception as e:
-        logger.error("Reset failed: %s", e)
+        logger.exception("Reset failed")
         raise HTTPException(status_code=500, detail=f"Reset failed: {str(e)}")
 
 

@@ -7,16 +7,17 @@ identifies dependencies, and enables parallel execution where possible.
 from __future__ import annotations
 
 import json
-import logging
 import re
+import time
 from typing import Any
 
 from openai import OpenAI
 
 from config import settings
+from logger import get_logger, truncate_payload
 from model.tools import interface_library, get_dataset_schema, get_ticker_mapping
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 
@@ -142,8 +143,10 @@ If single operation: {{"use_dag": false, "reason": "Single step sufficient"}}
 
 JSON only, no explanation."""
 
+        plan_start = time.perf_counter()
+        raw_content = ""
         try:
-            content, token_usage = self._llm(
+            raw_content, token_usage = self._llm(
                 [
                     {"role": "system", "content": system},
                     {"role": "user", "content": f"Query: {query}"}
@@ -151,18 +154,41 @@ JSON only, no explanation."""
                 temperature=0.1,
                 max_tokens=1500,
             )
-            
-            dag = self._parse_json(content)
+
+            dag = self._parse_json(raw_content)
             dag["token_usage"] = token_usage
-            
+
             # Validate DAG structure
             if dag.get("use_dag"):
                 self._validate_dag(dag)
-            
+                step_summary = [
+                    {
+                        "id": s["id"],
+                        "interface": s["interface"],
+                        "depends_on": s["depends_on"],
+                    }
+                    for s in dag.get("steps", [])
+                ]
+                logger.debug("Generated DAG plan: %s", truncate_payload(step_summary, 500))
+
+            planning_ms = (time.perf_counter() - plan_start) * 1000
+            logger.info(
+                "DAG planning complete | use_dag=%s | steps=%d | latency=%.1fms | tokens=%d",
+                dag.get("use_dag", False),
+                len(dag.get("steps", [])),
+                planning_ms,
+                token_usage.get("total_tokens", 0),
+            )
             return dag
-            
+
         except Exception as e:
-            logger.error("DAG generation failed: %s", e)
+            planning_ms = (time.perf_counter() - plan_start) * 1000
+            logger.error(
+                "DAG planning/validation failed (latency=%.1fms): %s | raw_output=%s",
+                planning_ms,
+                e,
+                truncate_payload(raw_content, 500),
+            )
             return {
                 "use_dag": False,
                 "reason": f"DAG generation error: {e}",

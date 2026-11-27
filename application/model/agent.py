@@ -11,17 +11,18 @@ This implements the full Phase 1 + Phase 2 loop from the research paper.
 from __future__ import annotations
 
 import json
-import logging
 import re
+import time
 import traceback
 from typing import Any
 
 from openai import OpenAI
 
 from config import settings
+from logger import get_logger, sanitize_args, truncate_payload
 from model.tools import interface_library, get_dataset_schema, get_ticker_mapping
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 
@@ -29,26 +30,112 @@ class Agent:
     def __init__(self) -> None:
         api_key = settings.groq_api_key
         if not api_key:
+            logger.error("Agent initialization failed: GROQ_API_KEY not set")
             raise ValueError("GROQ_API_KEY not set in .env")
         self.client = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL)
         self.model = settings.groq_model
+        logger.info("Agent initialized | model=%s | base_url=%s", self.model, GROQ_BASE_URL)
+
+    # Models whose thinking tokens land in reasoning_content / <think> tags
+    # and therefore need reasoning_format="hidden" for JSON mode to work.
+    _THINKING_MODEL_PREFIXES = ("qwen3", "qwen/qwen3", "deepseek-r1", "deepseek/r1")
+
+    def _is_thinking_model(self) -> bool:
+        m = self.model.lower()
+        return any(m.startswith(p) for p in self._THINKING_MODEL_PREFIXES)
 
     def _llm(self, messages: list[dict], temperature: float = 0.1,
-             max_tokens: int = 1000) -> tuple[str, dict[str, int]]:
-        """Call the LLM and return the response content + token usage."""
-        response = self.client.chat.completions.create(
+             max_tokens: int = 1000,
+             json_mode: bool = False) -> tuple[str, dict[str, int]]:
+        """Call the LLM and return the response content + token usage.
+
+        For Groq thinking models (Qwen3, DeepSeek-R1) the chain-of-thought
+        occupies reasoning_content and content can be empty when
+        response_format=json_object is used without reasoning_format=hidden.
+        We always pass reasoning_format=hidden for those models so the
+        thinking tokens are suppressed and the final answer lands in content.
+        """
+        extra: dict[str, Any] = {"tool_choice": "none"}
+        if self._is_thinking_model():
+            # Suppress chain-of-thought; Groq will put the answer in content.
+            extra["reasoning_format"] = "hidden"
+
+        kwargs: dict[str, Any] = dict(
             model=self.model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
-            extra_body={"tool_choice": "none"},
+            extra_body=extra,
         )
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        logger.debug(
+            "_llm call start | model=%s | messages=%d | temp=%.2f | max_tokens=%d | json_mode=%s",
+            self.model,
+            len(messages),
+            temperature,
+            max_tokens,
+            json_mode,
+        )
+        llm_start = time.perf_counter()
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+        except Exception:
+            llm_ms = (time.perf_counter() - llm_start) * 1000
+            logger.exception("_llm call failed | model=%s | duration=%.1fms", self.model, llm_ms)
+            raise
+
+        llm_ms = (time.perf_counter() - llm_start) * 1000
+        usage = getattr(response, "usage", None)
         token_usage = {
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens,
+            "prompt_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
+            "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+            "total_tokens": getattr(usage, "total_tokens", 0) if usage else 0,
         }
-        return response.choices[0].message.content.strip(), token_usage
+        choice = response.choices[0]
+        finish_reason = choice.finish_reason
+
+        logger.info(
+            "_llm call end | model=%s | duration=%.1fms | tokens=%d (prompt=%d, completion=%d) | finish_reason=%s",
+            self.model,
+            llm_ms,
+            token_usage["total_tokens"],
+            token_usage["prompt_tokens"],
+            token_usage["completion_tokens"],
+            finish_reason,
+        )
+
+        # Primary content field
+        raw_content = choice.message.content or ""
+
+        # Fallback: some provider builds / older SDK versions surface the
+        # answer inside reasoning_content when hidden mode isn't honoured.
+        if not raw_content.strip():
+            reasoning = getattr(choice.message, "reasoning_content", None) or ""
+            if reasoning.strip():
+                logger.warning(
+                    "_llm: content was empty; falling back to reasoning_content "
+                    "(model=%s, finish_reason=%s). "
+                    "Consider switching to a non-thinking model or setting "
+                    "reasoning_format=hidden explicitly.",
+                    self.model, finish_reason,
+                )
+                raw_content = reasoning
+
+        # Log early so we can inspect exactly what Groq returned
+        logger.debug(
+            "_llm raw response (model=%s, finish_reason=%s, json_mode=%s): %s",
+            self.model, finish_reason, json_mode, raw_content[:500],
+        )
+
+        if finish_reason == "length":
+            logger.warning(
+                "_llm: finish_reason=length — response was truncated! "
+                "Increase max_tokens (current=%d).", max_tokens
+            )
+
+        return raw_content.strip(), token_usage
 
     # ── Step 1: Decide — reuse or create ──────────────────────────
 
@@ -164,12 +251,24 @@ ALWAYS use .NS suffix for tickers and correct year (2022-2024)! RESPOND ONLY WIT
         messages.append({"role": "user", "content": query})
 
         try:
+            logger.debug(
+                "decide() routing | candidate=%s | score=%s | query=%s",
+                candidate["name"] if candidate else None,
+                f"{similarity_score:.3f}" if similarity_score is not None else "N/A",
+                truncate_payload(query, 200),
+            )
             content, token_usage = self._llm(messages, temperature=0.1)
             result = self._parse_json(content)
             result["token_usage"] = token_usage
+            logger.info(
+                "decide() result | action=%s | interface=%s | args=%s",
+                result.get("action"),
+                result.get("interface_name"),
+                sanitize_args(result.get("args")),
+            )
             return result
         except Exception as e:
-            logger.error("decide() failed: %s", e)
+            logger.error("decide() failed: %s — falling back to action='create'", e)
             return {"action": "create", "interface_name": None, "args": None, "token_usage": {"total_tokens": 0}}
 
     # ── Step 2: Generate a new interface ──────────────────────────
@@ -232,7 +331,7 @@ Query: "Plot 50-day MA for TCS" → name="plot_moving_average", args={{"ticker":
 Query: "Bajaj Finance 2024 range" → name="get_price_range", args={{"ticker":"BAJFINANCE.NS", "weeks":52}}
 Query: "Compare TCS vs Infosys" → name="compare_two_stocks", args={{"ticker1":"TCS.NS", "ticker2":"INFY.NS"}}
 
-OUTPUT (valid JSON only):
+OUTPUT — respond with ONLY a raw JSON object (absolutely no markdown fences, no ```json, no prose):
 {{
   "name": "function_name",
   "description": "brief description",
@@ -241,9 +340,11 @@ OUTPUT (valid JSON only):
   "test_args": {{"ticker": "TCS.NS", "year": 2024}}
 }}
 
-CRITICAL: Use .NS suffix and year 2022-2024 in ALL args/test_args! Respond ONLY with JSON."""
+CRITICAL: Use .NS suffix and year 2022-2024 in ALL args/test_args.
+CRITICAL: Your ENTIRE response must be valid JSON — no markdown fences, no explanations."""
 
         for attempt in range(3):
+            logger.info("generate_interface attempt %d/3 | query=%s", attempt + 1, truncate_payload(query, 200))
             try:
                 content, token_usage = self._llm(
                     [
@@ -251,7 +352,8 @@ CRITICAL: Use .NS suffix and year 2022-2024 in ALL args/test_args! Respond ONLY 
                         {"role": "user", "content": f"Query: {query}"},
                     ],
                     temperature=0.1 + attempt * 0.05,  # Lower temperature for more deterministic code
-                    max_tokens=1200,
+                    max_tokens=4096,
+                    json_mode=True,
                 )
                 
                 # Accumulate token usage
@@ -259,7 +361,7 @@ CRITICAL: Use .NS suffix and year 2022-2024 in ALL args/test_args! Respond ONLY 
                 total_token_usage["completion_tokens"] += token_usage.get("completion_tokens", 0)
                 total_token_usage["total_tokens"] += token_usage.get("total_tokens", 0)
                 
-                spec = self._parse_json(content)
+                spec = self._parse_json_response(content)
                 name = spec["name"]
                 code = spec["code"]
                 description = spec["description"]
@@ -393,9 +495,48 @@ CRITICAL: Use .NS suffix and year 2022-2024 in ALL args/test_args! Respond ONLY 
     # ── JSON parsing ───────────────────────────────────────────────
 
     @staticmethod
+    def _parse_json_response(raw: str) -> dict[str, Any]:
+        """
+        Robust JSON parser that handles:
+        - Empty / None content → raises ValueError with a clear message.
+        - Markdown code fences (```json ... ``` or ``` ... ```).
+        - Leading / trailing prose around the outermost { ... } block.
+        Logs the raw content and strips it before calling json.loads().
+        """
+        if not raw or not raw.strip():
+            logger.error("_parse_json_response: received empty/None content from LLM")
+            raise ValueError("LLM returned empty content — cannot parse JSON.")
+
+        cleaned = raw.strip()
+
+        # Strip Markdown code fences
+        fence_match = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned)
+        if fence_match:
+            cleaned = fence_match.group(1).strip()
+            logger.debug("_parse_json_response: stripped markdown fence")
+
+        # Extract outermost { ... } block (handles leading/trailing prose)
+        brace_match = re.search(r"\{[\s\S]*\}", cleaned)
+        if brace_match:
+            extracted = brace_match.group(0)
+            if extracted != cleaned:
+                logger.debug(
+                    "_parse_json_response: extracted JSON block from prose. "
+                    "Leading chars dropped: %d", brace_match.start()
+                )
+            cleaned = extracted
+
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            logger.error(
+                "_parse_json_response: JSONDecodeError at char %d — %s\n"
+                "--- RAW LLM OUTPUT (first 2000 chars) ---\n%s\n--- END RAW OUTPUT ---",
+                exc.pos, exc.msg, raw[:2000],
+            )
+            raise
+
+    # Keep old name as an alias so callers that weren't updated still work.
+    @staticmethod
     def _parse_json(content: str) -> dict[str, Any]:
-        if "```" in content:
-            match = re.search(r"```(?:json)?\s*(.*?)```", content, re.DOTALL)
-            if match:
-                content = match.group(1).strip()
-        return json.loads(content)
+        return Agent._parse_json_response(content)

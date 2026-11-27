@@ -17,6 +17,9 @@ env/
 # Generated chart images
 application/static/charts/*.png
 
+# Application logs
+application/logs/
+
 # Dataset (large file, downloadable via script)
 data/
 

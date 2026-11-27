@@ -10,11 +10,11 @@ Flow per query:
 
 from __future__ import annotations
 
-import logging
 import time
 from typing import Any
 
 from config import settings
+from logger import get_logger, sanitize_args, truncate_payload
 from model.tools import interface_library, get_dataset_schema
 from model.retriever import ToolRetriever
 from model.agent import Agent
@@ -22,7 +22,7 @@ from model.executor import Executor
 from model.dag_planner import dag_planner
 from model.dag_executor import dag_executor
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class AgentService:
@@ -35,11 +35,12 @@ class AgentService:
 
     def _rebuild_index(self) -> None:
         """Rebuild FAISS index from current library."""
+        logger.debug("Rebuilding retriever index")
         self.retriever.rebuild(interface_library.get_descriptions())
 
     def list_tools(self) -> list[dict[str, Any]]:
         """Return all registered interfaces (for /api/tools endpoint)."""
-        return [
+        tools = [
             {
                 "name": i["name"],
                 "description": i["description"],
@@ -51,6 +52,8 @@ class AgentService:
             }
             for i in interface_library.list_all()
         ]
+        logger.debug("AgentService.list_tools | count=%d", len(tools))
+        return tools
 
     def process_query(
         self,
@@ -59,6 +62,17 @@ class AgentService:
         history: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         start = time.perf_counter()
+        if not isinstance(query, str) or not query.strip():
+            logger.warning("AgentService.process_query validation failed: empty query")
+            raise ValueError("Query must be a non-empty string")
+
+        effective_routing = routing_mode or settings.routing_mode
+        logger.info(
+            "AgentService.process_query entry | routing_mode=%s | history_turns=%d | query=%s",
+            effective_routing,
+            len(history or []),
+            truncate_payload(query, 500),
+        )
         is_new_interface = False
         total_tokens = 0  # Track total token usage
         use_dag = False  # Track if DAG was used
@@ -155,7 +169,7 @@ class AgentService:
         total_tokens += decision.get("token_usage", {}).get("total_tokens", 0)
 
         logger.info("Decision: action=%s | interface=%s | args=%s",
-                    action, interface_name, args)
+                    action, interface_name, sanitize_args(args))
 
         # ── Step 3: Create new interface if needed ─────────────
         if action == "create":
